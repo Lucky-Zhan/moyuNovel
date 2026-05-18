@@ -1,0 +1,37 @@
+{
+  "name": "moyu-novel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex-like local TXT novel reader.",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node tests/reader-core.test.mjs && node tests/electron-options.test.mjs && node tests/window-state.test.mjs",
+    "check": "node --check app.js && node --check src/core.js && node --check src/storage.js && node --check src/icons.js && node --check electron/main.mjs && node --check electron/preload.mjs && node --check electron/options.mjs && node --check electron/window-state.mjs",
+    "dist:mac": "electron-builder --mac dmg",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.moyu.novel",
+    "productName": "moyuNovel",
+    "files": [
+      "index.html",
+      "app.js",
+      "style.css",
+      "src/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg"
+      ]
+    }
+  }
+}

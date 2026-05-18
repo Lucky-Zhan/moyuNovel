@@ -1,121 +1,180 @@
-const STORAGE_KEY = 'codex-novel-reader:v2';
-const UI_KEY = 'codex-novel-reader:ui:v2';
-const DEFAULT_PAGE_LINES = 16;
-
-const demoText = [
-  '第一章 终端里的雪',
-  '',
-  '夜色沉进屏幕边缘时，终端还亮着。',
-  '一行行日志像细雪落下，安静地遮住了真正的故事。',
-  '她把光标停在最后一段提示词后面，等系统继续运行，也等自己继续往前走。',
-  '',
-  '窗口外的城市没有声音，只有风把玻璃擦得很亮。',
-  '代码、注释、警告、重试，都像某种日常的伪装。',
-  '而小说就在中间，灰得刚好，像一段还没有提交的心事。',
-  '',
-  '她知道，真正重要的东西不一定需要大声出现。',
-  '有时候，它只需要在一块安静的区域里，被慢慢读完。',
-  '',
-  '第二章 未保存的更改',
-  '',
-  '凌晨一点，状态栏仍然显示 ready。',
-  '她把杯子推到键盘右侧，指尖落在方向键上。',
-  '日志继续刷新，像有人在替她维持一个合理的现场。',
-  '',
-  '左侧文件树亮着，右侧检查器列出运行结果。',
-  '中间那块被称为 modified 的区域，藏着另一条时间线。',
-  '每翻过一页，进度条就向前挪一点。',
-  '',
-  '她并不急。',
-  '越是安静的故事，越适合在看似繁忙的界面里慢慢展开。',
-  '',
-  '第三章 本地缓存',
-  '',
-  '浏览器记住了她停下的位置。',
-  '下一次打开，故事会从同一行醒来。',
-  '这件事很小，但足够让一个夜晚显得有秩序。',
-].join('\n');
+import {
+  DEMO_BOOK_ID,
+  calculateProgress,
+  clamp,
+  createBookRecord,
+  decodeTextBuffer,
+  demoBook,
+  escapeHtml,
+  extractChapters,
+  filterTextFiles,
+  findMatches,
+  formatBytes,
+  formatProgress,
+  highlightSearchMatches,
+  isChapterTitle,
+  mergeBookRecord,
+  nextActiveBookIdAfterDelete,
+  normalizePreference,
+  prepareReadingText,
+  sanitizeBookTitle,
+  sanitizeProjectLabel,
+  splitTextBlocks,
+} from './src/core.js?v=6';
+import {
+  COMPOSER_KEY,
+  PROJECTS_KEY,
+  clearBooks,
+  deleteBook,
+  getAllBooks,
+  getBook,
+  openLibrary,
+  putBook,
+  readJson,
+  saveJson,
+  UI_KEY,
+} from './src/storage.js?v=7';
+import {
+  iconArrowUp,
+  iconChevronDown,
+  iconChevronLeft,
+  iconChevronRight,
+  iconClock,
+  iconEdit,
+  iconFace,
+  iconFolder,
+  iconGrid,
+  iconInfo,
+  iconList,
+  iconPanel,
+  iconPlay,
+  iconPlus,
+  iconSearch,
+  iconSettings,
+  iconSidebar,
+  iconTerminal,
+  iconTerminalSmall,
+} from './src/icons.js?v=6';
 
 const app = document.querySelector('#app');
-const state = loadState();
+const state = {
+  books: [],
+  activeBookId: null,
+  fontSize: 21,
+  lineHeight: 1.9,
+  readerWidth: 850,
+  fontFamily: 'songti',
+  theme: 'light',
+  autoScroll: false,
+  autoScrollSpeed: 3,
+  prefsOpen: false,
+  db: null,
+  status: '正在处理...',
+  error: '',
+  restoreScrollTop: null,
+  saveTimer: null,
+  autoScrollTimer: null,
+  searchQuery: '',
+  searchIndex: 0,
+  composerText: '',
+  projectGroups: [],
+};
 
 document.addEventListener('keydown', handleKeydown);
+window.moyuNovelShell?.onCommand?.((command) => {
+  if (command === 'import-file') app?.querySelector('#file-input')?.click();
+  if (command === 'import-folder') app?.querySelector('#folder-input')?.click();
+  if (command === 'clear-library') clearLibrary();
+  if (command === 'reset-preferences') resetPreferences();
+});
+window.addEventListener?.('beforeunload', () => {
+  const reader = app?.querySelector('[data-reader-scroll]');
+  const active = getActiveBook();
+  if (!reader || !active) return;
 
-render();
+  active.scrollTop = Math.round(reader.scrollTop);
+  active.progress = calculateProgress({
+    scrollTop: reader.scrollTop,
+    scrollHeight: reader.scrollHeight,
+    clientHeight: reader.clientHeight,
+  });
+  active.lastReadAt = Date.now();
+  saveBookProgress(active).catch(() => {});
+});
+init();
 
-function loadState() {
-  const saved = readJson(STORAGE_KEY) || {};
+async function init() {
   const ui = readJson(UI_KEY) || {};
-  const text = typeof saved.text === 'string' && saved.text.trim() ? saved.text : demoText;
-  const title = saved.title || 'demo-novel.txt';
-  const lines = splitLines(text);
-  const line = clamp(Number(saved.positions?.[bookId(title, text)] || saved.line || 0), 0, Math.max(lines.length - 1, 0));
+  state.fontSize = normalizePreference('fontSize', ui.fontSize || 21);
+  state.lineHeight = normalizePreference('lineHeight', ui.lineHeight || 1.9);
+  state.readerWidth = normalizePreference('readerWidth', ui.readerWidth || 850);
+  state.fontFamily = normalizePreference('fontFamily', ui.fontFamily || 'songti');
+  state.theme = normalizePreference('theme', ui.theme || 'light');
+  state.autoScroll = normalizePreference('autoScroll', ui.autoScroll || false);
+  state.autoScrollSpeed = normalizePreference('autoScrollSpeed', ui.autoScrollSpeed || 3);
+  state.activeBookId = typeof ui.activeBookId === 'string' ? ui.activeBookId : null;
+  state.projectGroups = readJson(PROJECTS_KEY) || [];
+  state.composerText = readJson(COMPOSER_KEY)?.text || '';
 
-  return {
-    title,
-    text,
-    lines,
-    line,
-    fontSize: clamp(Number(ui.fontSize || 21), 16, 30),
-    pageLines: DEFAULT_PAGE_LINES,
-  };
+  try {
+    state.db = await openLibrary();
+    await ensureDemoBook();
+    state.books = await getAllBooks(state.db);
+  } catch {
+    state.error = '当前仅显示演示文本。';
+    state.books = [demoBook()];
+  }
+
+  if (!state.books.some((book) => book.id === state.activeBookId)) {
+    state.activeBookId = state.books[0]?.id || DEMO_BOOK_ID;
+  }
+
+  const active = getActiveBook();
+  state.restoreScrollTop = active?.scrollTop || 0;
+  state.status = '已处理 1s';
+  saveUi();
+  render();
 }
 
 function render() {
-  const total = Math.max(state.lines.length, 1);
-  const end = Math.min(state.line + state.pageLines, total);
-  const pageLines = state.lines.slice(state.line, end);
-  const progress = total <= 1 ? 0 : Math.round((state.line / (total - 1)) * 100);
-  const delta = Math.max(end - state.line, 0);
+  if (!app) return;
+
+  const active = getActiveBook() || demoBook();
+  const progress = clamp(Number(active.progress || 0), 0, 100);
+  const textBlocks = splitTextBlocks(active.text);
+  const chapters = extractChapters(textBlocks);
+  const matches = findMatches(textBlocks, state.searchQuery);
+  state.searchIndex = matches.length ? clamp(state.searchIndex, 0, matches.length - 1) : 0;
 
   app.innerHTML = `
-    <div class="codex-window">
+    <div class="codex-window" data-theme="${escapeHtml(state.theme)}" style="--reader-width: ${state.readerWidth}px">
       <aside class="sidebar">
         <div class="sidebar-top">
-          <div class="traffic" aria-hidden="true"><span></span><span></span><span></span></div>
           <button class="sidebar-icon" type="button" aria-label="切换侧边栏">${iconSidebar()}</button>
         </div>
 
         <nav class="primary-nav" aria-label="主导航">
-          <button type="button">${iconEdit()}<span>New chat</span></button>
-          <button type="button">${iconSearch()}<span>Search</span></button>
-          <button type="button">${iconGrid()}<span>Plugins</span></button>
+          <button type="button" data-action="import-file">${iconEdit()}<span>新对话</span></button>
+          <button type="button" data-action="focus-search">${iconSearch()}<span>搜索</span></button>
+          <button type="button">${iconGrid()}<span>插件</span></button>
+          <button type="button">${iconClock()}<span>自动化</span></button>
         </nav>
 
         <div class="sidebar-scroll">
-          ${quickSection('用户提示词', [
-            ['ai完成率测试', '⌘5'],
-            ['OK，我想跟你讨论一下ai自动...', '⌘6'],
-            ['开发', '⌘7'],
-            ['生成数据开发平台页面', '⌘8'],
-          ])}
+          <div class="sidebar-label">项目</div>
+          ${projectSections()}
+          <button class="thread-row ghost add-row" type="button" data-action="add-project"><span>新建项目</span><time>＋</time></button>
 
-          ${folderSection('tsRebuild', [
-            ['接口测试专家', '1mo'],
-            ['了解 Jenkins', '1w'],
-            ['我想统计一下我在用大模型重...', '3d'],
-            ['接口修复专家', '1mo'],
-          ])}
-
-          <section class="sidebar-section">
-            <div class="folder-title">${iconFolder()}<span>Playground</span></div>
-            <button class="thread-row active" type="button">
-              <span>小说阅读工作台</span>
-              <span class="spinner"></span>
-            </button>
-            <button class="thread-row" type="button"><span>查询地址位置</span><time>1w</time></button>
-            <button class="thread-row" type="button"><span>你看看github上，选出前10个...</span><time>6d</time></button>
-            <button class="thread-row" type="button"><span>mempalace</span><time>3w</time></button>
-            <button class="show-more" type="button">Show more</button>
-          </section>
+          <div class="sidebar-label chat-label">对话</div>
+          ${bookRows()}
         </div>
 
-        <button class="settings" type="button">${iconSettings()}<span>Settings</span></button>
+        <button class="settings" type="button" data-action="toggle-prefs" aria-label="设置">${iconSettings()}<span>设置</span></button>
       </aside>
 
       <main class="thread">
         <header class="thread-header">
-          <h1>小说阅读工作台</h1>
+          <h1>${escapeHtml(active.title || '小说阅读工作台')}</h1>
           <button class="more-button" type="button" aria-label="更多">•••</button>
           <div class="thread-actions">
             <button type="button" aria-label="运行">${iconPlay()}</button>
@@ -126,63 +185,55 @@ function render() {
           </div>
         </header>
 
-        <div class="thread-body">
+        <div class="thread-body" data-reader-scroll>
           <section class="message-stack">
-            <div class="tool-line">${iconTerminalSmall()}<span>Ran 3 commands</span></div>
+            <div class="tool-line">${iconTerminalSmall()}<span>${escapeHtml(state.error || state.status)} ›</span></div>
 
-            <article class="assistant-message novel-message" style="--novel-size: ${state.fontSize}px">
+            <article class="assistant-message novel-message font-${escapeHtml(state.fontFamily)}" style="--novel-size: ${state.fontSize}px; --novel-line: ${state.lineHeight}">
               <div class="message-title-row">
-                <span>${escapeHtml(state.title)}</span>
-                <span>${state.line + 1}-${end}/${total}</span>
+                <span>已打开 ${escapeHtml(active.fileName || active.title)}</span>
+                <span>${progress ? `${progress}%` : '就绪'}</span>
               </div>
-              <div class="novel-copy">
-                ${pageLines.map((line) => `<p>${line ? escapeHtml(line) : '&nbsp;'}</p>`).join('')}
-              </div>
-            </article>
-
-            <div class="tool-line strong">${iconTerminalSmall()}<span>Edited 2 files</span><span>ran 1 command</span></div>
-
-            <article class="assistant-message status-message">
-              <p>已缓存当前阅读位置。继续翻页会更新本地进度，不会上传文本。</p>
-              <div class="mini-shot">
-                <div class="shot-sidebar"></div>
-                <div class="shot-main">
-                  <span></span><span></span><span></span><span></span>
+              <div class="reader-command-bar">
+                ${chapterJump(chapters)}
+                <div class="reader-search">
+                  ${iconSearch()}
+                  <input id="search-input" type="search" value="${escapeHtml(state.searchQuery)}" placeholder="搜索当前书" autocomplete="off" />
+                  <span>${formatSearchCount(matches)}</span>
+                  <button type="button" data-action="search-prev" aria-label="上一个命中">${iconChevronLeft()}</button>
+                  <button type="button" data-action="search-next" aria-label="下一个命中">${iconChevronRight()}</button>
                 </div>
               </div>
+              <div class="novel-copy">
+                ${textBlocks.map((block, index) => `<p data-line-index="${index}" class="${lineClass(block, index, matches)}">${block ? renderTextLine(block, index, matches) : '&nbsp;'}</p>`).join('')}
+              </div>
             </article>
-
-            <div class="tool-line muted">${iconTerminalSmall()}<span>Running git status --short</span></div>
-            <div class="thinking">Thinking</div>
           </section>
         </div>
 
         <footer class="composer-area">
-          <div class="change-strip">
-            <span>${delta} lines changed</span>
-            <strong>+${progress}</strong>
-            <em>-0</em>
-            <button type="button" data-action="next">Review here</button>
-          </div>
-
           <div class="composer">
-            <div class="composer-text">你要做的和codex一模一样的感觉</div>
+            <textarea id="composer-input" class="composer-input" placeholder="要求后续变更">${escapeHtml(state.composerText)}</textarea>
             <div class="composer-bottom">
-              <button class="round-button" type="button" data-action="import" aria-label="导入 TXT">＋</button>
-              <button class="access-button" type="button">Full access ${iconChevronDown()}</button>
+              <button class="round-button" type="button" data-action="import-file" aria-label="导入 TXT">${iconPlus()}</button>
+              <button class="access-button" type="button" data-action="import-folder">打开文件夹 ${iconChevronDown()}</button>
               <input id="file-input" type="file" accept=".txt,text/plain" hidden />
+              <input id="folder-input" type="file" accept=".txt,text/plain" webkitdirectory multiple hidden />
               <div class="spacer"></div>
               <button class="small-text-button" type="button" data-action="font-down">A-</button>
               <button class="small-text-button" type="button" data-action="font-up">A+</button>
-              <span class="model-label">5.5&nbsp; High ${iconChevronDown()}</span>
-              <button class="send-button" type="button" data-action="next" aria-label="下一页">${iconArrowUp()}</button>
+              <button class="small-text-button" type="button" data-action="toggle-auto-scroll">${state.autoScroll ? '停' : '自动'}</button>
+              <button class="small-text-button icon-text-button" type="button" data-action="toggle-prefs" aria-label="阅读偏好">${iconSettings()}</button>
+              <span class="model-label">5.5&nbsp; 中 ${iconChevronDown()}</span>
+              <button class="send-button" type="button" data-action="noop-send" aria-label="发送但不执行">${iconArrowUp()}</button>
             </div>
           </div>
+          ${preferencesPanel()}
 
           <div class="pager">
-            <button type="button" data-action="prev">${iconChevronLeft()} 上一页</button>
+            <button type="button" data-action="scroll-top">${iconChevronLeft()} 顶部</button>
             <div><span style="width:${progress}%"></span></div>
-            <button type="button" data-action="next">下一页 ${iconChevronRight()}</button>
+            <button type="button" data-action="scroll-bottom">继续 ${iconChevronRight()}</button>
           </div>
         </footer>
       </main>
@@ -190,203 +241,521 @@ function render() {
   `;
 
   bindDom();
+  restoreScrollPosition();
+  syncAutoScroll();
 }
 
 function bindDom() {
   app.querySelectorAll('[data-action]').forEach((button) => {
-    button.addEventListener('click', () => handleAction(button.dataset.action));
+    button.addEventListener('click', () => handleAction(button.dataset.action, button.dataset.projectGroupId));
   });
-  app.querySelector('#file-input')?.addEventListener('change', handleFile);
+  app.querySelectorAll('[data-book-id]').forEach((button) => {
+    button.addEventListener('click', () => selectBook(button.dataset.bookId));
+    button.addEventListener('keydown', handleBookRowKeydown);
+  });
+  app.querySelector('#file-input')?.addEventListener('change', (event) => importFiles(event.target.files, event.target));
+  app.querySelector('#folder-input')?.addEventListener('change', (event) => importFiles(event.target.files, event.target));
+  app.querySelector('#chapter-select')?.addEventListener('change', (event) => jumpToLine(Number(event.target.value)));
+  app.querySelector('#search-input')?.addEventListener('input', handleSearchInput);
+  app.querySelector('#search-input')?.addEventListener('keydown', handleSearchKeydown);
+  app.querySelector('#composer-input')?.addEventListener('input', handleComposerInput);
+  app.querySelectorAll('[data-project-id]').forEach((node) => {
+    node.addEventListener('click', (event) => event.stopPropagation());
+    node.addEventListener('blur', handleProjectEdit);
+    node.addEventListener('keydown', handleEditableKeydown);
+  });
+  app.querySelectorAll('[contenteditable][data-project-group-id]').forEach((node) => {
+    node.addEventListener('blur', handleProjectGroupEdit);
+    node.addEventListener('keydown', handleEditableKeydown);
+  });
+  app.querySelectorAll('[data-edit-book-id]').forEach((node) => {
+    node.addEventListener('click', (event) => event.stopPropagation());
+    node.addEventListener('blur', handleBookInlineEdit);
+    node.addEventListener('keydown', handleEditableKeydown);
+  });
+  app.querySelectorAll('[data-pref]').forEach((control) => {
+    control.addEventListener('input', handlePreferenceInput);
+    control.addEventListener('change', handlePreferenceInput);
+  });
+  app.querySelector('[data-reader-scroll]')?.addEventListener('scroll', handleReaderScroll, { passive: true });
 }
 
-function handleAction(action) {
-  if (action === 'import') {
-    app.querySelector('#file-input')?.click();
-    return;
-  }
+function handleAction(action, projectGroupId) {
+  if (action === 'import-file') return app.querySelector('#file-input')?.click();
+  if (action === 'import-folder') return app.querySelector('#folder-input')?.click();
+  if (action === 'add-project') return addProject();
+  if (action === 'add-session') return addProjectSession(projectGroupId);
+  if (action === 'focus-search') return app.querySelector('#search-input')?.focus();
+  if (action === 'search-next') return moveSearch(1);
+  if (action === 'search-prev') return moveSearch(-1);
+  if (action === 'rename-book') return renameActiveBook();
+  if (action === 'delete-book') return deleteActiveBook();
+  if (action === 'clear-library') return clearLibrary();
+  if (action === 'noop-send') return;
 
-  if (action === 'next') {
-    movePage(1);
-    return;
-  }
-
-  if (action === 'prev') {
-    movePage(-1);
-    return;
-  }
-
-  if (action === 'font-up') {
-    state.fontSize = clamp(state.fontSize + 1, 16, 30);
+  if (action === 'font-up' || action === 'font-down') {
+    state.fontSize = normalizePreference('fontSize', state.fontSize + (action === 'font-up' ? 1 : -1));
     saveUi();
     render();
     return;
   }
 
-  if (action === 'font-down') {
-    state.fontSize = clamp(state.fontSize - 1, 16, 30);
+  if (action === 'toggle-auto-scroll') {
+    state.autoScroll = !state.autoScroll;
     saveUi();
     render();
+    return;
   }
+
+  if (action === 'toggle-prefs') {
+    state.prefsOpen = !state.prefsOpen;
+    render();
+    return;
+  }
+
+  const reader = app.querySelector('[data-reader-scroll]');
+  if (action === 'scroll-top') return reader?.scrollTo({ top: 0, behavior: 'smooth' });
+  if (action === 'scroll-bottom') reader?.scrollBy({ top: Math.max(reader.clientHeight * 0.82, 360), behavior: 'smooth' });
 }
 
-function handleKeydown(event) {
-  if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
-    event.preventDefault();
-    movePage(1);
-  }
-
-  if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
-    event.preventDefault();
-    movePage(-1);
-  }
-}
-
-function movePage(direction) {
-  const maxStart = Math.max(state.lines.length - state.pageLines, 0);
-  state.line = clamp(state.line + direction * state.pageLines, 0, maxStart);
-  saveBook();
+function resetPreferences() {
+  state.fontSize = 21;
+  state.lineHeight = 1.9;
+  state.readerWidth = 850;
+  state.fontFamily = 'songti';
+  state.theme = 'light';
+  state.autoScroll = false;
+  state.autoScrollSpeed = 3;
+  state.prefsOpen = false;
+  state.status = '已处理 1s · 已重置偏好';
+  saveUi();
   render();
 }
 
-function handleFile(event) {
-  const file = event.target.files?.[0];
-  if (!file) return;
-
-  const reader = new FileReader();
-  reader.onload = () => {
-    const text = String(reader.result || '').replace(/\r\n/g, '\n');
-    if (!text.trim()) return;
-
-    state.title = file.name;
-    state.text = text;
-    state.lines = splitLines(text);
-    state.line = 0;
-    saveBook();
-    render();
+function addProject() {
+  const now = Date.now();
+  const project = {
+    id: `project-${now}`,
+    title: '新项目',
+    rows: [],
   };
-  reader.readAsText(file, 'utf-8');
+  state.projectGroups = [...state.projectGroups, project];
+  saveJson(PROJECTS_KEY, state.projectGroups);
+  render();
+  requestAnimationFrame(() => app.querySelector(`[data-project-group-id="${cssEscape(project.id)}"]`)?.focus());
 }
 
-function saveBook() {
-  const previous = readJson(STORAGE_KEY) || {};
-  const id = bookId(state.title, state.text);
-  const positions = { ...(previous.positions || {}), [id]: state.line };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: state.title, text: state.text, line: state.line, positions }));
+function addProjectSession(projectGroupId) {
+  if (!state.projectGroups.length) {
+    addProject();
+    requestAnimationFrame(addProjectSession);
+    return;
+  }
+
+  const group = state.projectGroups.find((item) => item.id === projectGroupId) || state.projectGroups[0];
+  const row = { id: `session-${Date.now()}`, label: '新会话', time: '刚刚' };
+  state.projectGroups = state.projectGroups.map((item) => (item.id === group.id ? { ...item, rows: [row, ...item.rows] } : item));
+  saveJson(PROJECTS_KEY, state.projectGroups);
+  render();
+  requestAnimationFrame(() => app.querySelector(`[data-project-id="${cssEscape(row.id)}"]`)?.focus());
 }
 
-function saveUi() {
-  localStorage.setItem(UI_KEY, JSON.stringify({ fontSize: state.fontSize }));
+function handleSearchInput(event) {
+  state.searchQuery = event.target.value;
+  state.searchIndex = 0;
+  render();
+  if (state.searchQuery.trim()) requestAnimationFrame(() => jumpToCurrentSearch());
 }
 
-function quickSection(title, rows) {
-  return `
-    <section class="sidebar-section">
-      <h2>${escapeHtml(title)}</h2>
-      ${rows.map(([label, hotkey]) => `<button class="thread-row" type="button"><span>${escapeHtml(label)}</span><kbd>${escapeHtml(hotkey)}</kbd></button>`).join('')}
-      <button class="show-more" type="button">Show more</button>
-    </section>
-  `;
-}
-
-function folderSection(title, rows) {
-  return `
-    <section class="sidebar-section">
-      <div class="folder-title">${iconFolder()}<span>${escapeHtml(title)}</span></div>
-      ${rows.map(([label, time]) => `<button class="thread-row" type="button"><span>${escapeHtml(label)}</span><time>${escapeHtml(time)}</time></button>`).join('')}
-      <button class="show-more" type="button">Show more</button>
-    </section>
-  `;
-}
-
-function splitLines(text) {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
-}
-
-function bookId(title, text) {
-  return `${title}:${text.length}:${text.slice(0, 120)}`;
-}
-
-function readJson(key) {
-  try {
-    return JSON.parse(localStorage.getItem(key) || 'null');
-  } catch {
-    return null;
+function handleSearchKeydown(event) {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    moveSearch(event.shiftKey ? -1 : 1);
   }
 }
 
-function clamp(value, min, max) {
-  return Math.min(Math.max(value, min), max);
+function handleComposerInput(event) {
+  state.composerText = event.target.value;
+  saveJson(COMPOSER_KEY, { text: state.composerText });
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
+function handleEditableKeydown(event) {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    event.currentTarget.blur();
+  }
 }
 
-function iconEdit() {
-  return '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+function handleBookRowKeydown(event) {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  selectBook(event.currentTarget.dataset.bookId);
 }
 
-function iconSearch() {
-  return '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>';
+function handleProjectEdit(event) {
+  const id = event.currentTarget.dataset.projectId;
+  const label = sanitizeProjectLabel(event.currentTarget.textContent);
+  state.projectGroups = state.projectGroups.map((group) => ({
+    ...group,
+    rows: group.rows.map((row) => (row.id === id ? { ...row, label } : row)),
+  }));
+  saveJson(PROJECTS_KEY, state.projectGroups);
+  event.currentTarget.textContent = label;
 }
 
-function iconGrid() {
-  return '<svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/></svg>';
+function handleProjectGroupEdit(event) {
+  const id = event.currentTarget.dataset.projectGroupId;
+  const title = sanitizeProjectLabel(event.currentTarget.textContent);
+  state.projectGroups = state.projectGroups.map((group) => (group.id === id ? { ...group, title } : group));
+  saveJson(PROJECTS_KEY, state.projectGroups);
+  event.currentTarget.textContent = title;
 }
 
-function iconFolder() {
-  return '<svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5Z"/></svg>';
+async function handleBookInlineEdit(event) {
+  const id = event.currentTarget.dataset.editBookId;
+  const book = state.books.find((item) => item.id === id);
+  if (!book) return;
+
+  const title = sanitizeBookTitle(event.currentTarget.textContent);
+  const updated = { ...book, title, lastReadAt: Date.now() };
+  updateActiveBookInState(updated);
+  await persistBook(updated);
+  event.currentTarget.textContent = title;
+  if (id === state.activeBookId) {
+    app.querySelector('h1').textContent = title;
+  }
 }
 
-function iconSettings() {
-  return '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a8 8 0 0 0 .1-2l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.7-1L15 5.5h-4l-.4 2.6a8 8 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.5a8 8 0 0 0 .1 2l-2.1 1.5 2 3.4 2.5-1a8 8 0 0 0 1.6.9l.4 2.7h4l.4-2.7a8 8 0 0 0 1.6-.9l2.5 1 2-3.4Z"/></svg>';
+function handlePreferenceInput(event) {
+  const key = event.currentTarget.dataset.pref;
+  const value = key === 'autoScroll' ? event.currentTarget.value === 'true' : event.currentTarget.value;
+  state[key] = normalizePreference(key, value);
+  saveUi();
+  render();
 }
 
-function iconSidebar() {
-  return '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M9 5v14"/></svg>';
+function moveSearch(direction) {
+  const matches = findMatches(splitTextBlocks((getActiveBook() || demoBook()).text), state.searchQuery);
+  if (!matches.length) return;
+  state.searchIndex = (state.searchIndex + direction + matches.length) % matches.length;
+  render();
+  requestAnimationFrame(() => jumpToCurrentSearch());
 }
 
-function iconPlay() {
-  return '<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7Z"/></svg>';
+function jumpToCurrentSearch() {
+  const matches = findMatches(splitTextBlocks((getActiveBook() || demoBook()).text), state.searchQuery);
+  const match = matches[state.searchIndex];
+  if (match) jumpToLine(match.lineIndex);
 }
 
-function iconFace() {
-  return '<span class="face-icon">Finder</span>';
+function handleKeydown(event) {
+  const reader = app?.querySelector('[data-reader-scroll]');
+  if (!reader) return;
+  if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+    event.preventDefault();
+    reader.scrollBy({ top: Math.max(reader.clientHeight * 0.82, 360), behavior: 'smooth' });
+  }
+  if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+    event.preventDefault();
+    reader.scrollBy({ top: -Math.max(reader.clientHeight * 0.82, 360), behavior: 'smooth' });
+  }
 }
 
-function iconTerminal() {
-  return '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></svg>';
+async function selectBook(bookId) {
+  await saveCurrentReadingPosition();
+  state.activeBookId = bookId;
+  state.restoreScrollTop = getActiveBook()?.scrollTop || 0;
+  saveUi();
+  render();
 }
 
-function iconInfo() {
-  return '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>';
+async function renameActiveBook() {
+  const active = getActiveBook();
+  if (!active) return;
+  const input = window.prompt?.('重命名当前小说', active.title);
+  if (input === null || input === undefined) return;
+  const nextTitle = sanitizeBookTitle(input);
+  if (nextTitle === active.title) return;
+  const updated = { ...active, title: nextTitle, lastReadAt: Date.now() };
+  updateActiveBookInState(updated);
+  await persistBook(updated);
+  state.status = `已处理 1s · 已重命名 ${nextTitle}`;
+  render();
 }
 
-function iconPanel() {
-  return '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M15 5v14"/></svg>';
+async function deleteActiveBook() {
+  const active = getActiveBook();
+  if (!active || !window.confirm?.(`删除《${active.title}》？这会移除正文和进度。`)) return;
+  await deleteBook(state.db, active.id, (id) => {
+    state.books = state.books.filter((book) => book.id !== id);
+  });
+  state.books = state.books.filter((book) => book.id !== active.id);
+  if (!state.books.length) {
+    await persistBook(demoBook());
+    state.books = await getAllBooks(state.db, state.books);
+  }
+  state.activeBookId = nextActiveBookIdAfterDelete(state.books, active.id) || state.books[0]?.id || DEMO_BOOK_ID;
+  state.restoreScrollTop = getActiveBook()?.scrollTop || 0;
+  state.status = `已处理 1s · 已删除 ${active.title}`;
+  saveUi();
+  render();
 }
 
-function iconTerminalSmall() {
-  return '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m8 10 3 2-3 2"/><path d="M13 15h3"/></svg>';
+async function clearLibrary() {
+  if (!window.confirm?.('清空所有已导入小说和阅读进度？')) return;
+  await clearBooks(state.db, () => {
+    state.books = [];
+  });
+  await persistBook(demoBook());
+  state.books = await getAllBooks(state.db, state.books);
+  state.activeBookId = state.books[0]?.id || DEMO_BOOK_ID;
+  state.restoreScrollTop = 0;
+  state.status = '已处理 1s · 已清空';
+  saveUi();
+  render();
 }
 
-function iconChevronDown() {
-  return '<svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>';
+async function importFiles(fileList, input) {
+  const files = filterTextFiles(Array.from(fileList || []));
+  if (input) input.value = '';
+  if (!files.length) {
+    state.status = '没有发现 TXT 文件。';
+    render();
+    return;
+  }
+
+  const now = Date.now();
+  const imported = [];
+  for (const file of files) {
+    const text = prepareReadingText(await readFileText(file));
+    if (!text.trim()) continue;
+    const incoming = await createBookRecord({ name: file.name, size: file.size, text, now });
+    const existing = await getBook(state.db, incoming.id, state.books);
+    const record = mergeBookRecord(existing, incoming, now);
+    await persistBook(record);
+    imported.push(record);
+  }
+
+  if (!imported.length) {
+    state.status = 'TXT 文件为空，没有导入。';
+    render();
+    return;
+  }
+
+  state.books = await getAllBooks(state.db, state.books);
+  state.activeBookId = imported[0].id;
+  state.restoreScrollTop = 0;
+  state.status = `已处理 1s · 已导入 ${imported.length} 个 TXT`;
+  saveUi();
+  render();
 }
 
-function iconChevronLeft() {
-  return '<svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>';
+function handleReaderScroll(event) {
+  const reader = event.currentTarget;
+  const active = getActiveBook();
+  if (!active) return;
+  active.scrollTop = Math.round(reader.scrollTop);
+  active.progress = calculateProgress({ scrollTop: reader.scrollTop, scrollHeight: reader.scrollHeight, clientHeight: reader.clientHeight });
+  active.lastReadAt = Date.now();
+  updateActiveBookInState(active);
+  updateVisibleProgress(active);
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(() => {
+    saveBookProgress(active).catch(() => {
+      state.error = '保存阅读进度失败，可以继续阅读但刷新后可能无法恢复。';
+    });
+  }, 220);
 }
 
-function iconChevronRight() {
-  return '<svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>';
+async function saveCurrentReadingPosition() {
+  const reader = app?.querySelector('[data-reader-scroll]');
+  const active = getActiveBook();
+  if (!reader || !active) return;
+  active.scrollTop = Math.round(reader.scrollTop);
+  active.progress = calculateProgress({ scrollTop: reader.scrollTop, scrollHeight: reader.scrollHeight, clientHeight: reader.clientHeight });
+  active.lastReadAt = Date.now();
+  updateActiveBookInState(active);
+  await saveBookProgress(active);
 }
 
-function iconArrowUp() {
-  return '<svg viewBox="0 0 24 24"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>';
+function restoreScrollPosition() {
+  const reader = app.querySelector('[data-reader-scroll]');
+  const scrollTop = state.restoreScrollTop;
+  state.restoreScrollTop = null;
+  if (reader && scrollTop) requestAnimationFrame(() => { reader.scrollTop = scrollTop; });
+}
+
+function syncAutoScroll() {
+  if (state.autoScrollTimer) {
+    window.clearInterval(state.autoScrollTimer);
+    state.autoScrollTimer = null;
+  }
+
+  if (!state.autoScroll) return;
+  state.autoScrollTimer = window.setInterval(() => {
+    const reader = app.querySelector('[data-reader-scroll]');
+    if (!reader) return;
+    const maxScroll = Math.max(reader.scrollHeight - reader.clientHeight, 0);
+    if (reader.scrollTop >= maxScroll) {
+      state.autoScroll = false;
+      saveUi();
+      render();
+      return;
+    }
+    reader.scrollBy({ top: state.autoScrollSpeed, behavior: 'auto' });
+  }, 120);
+}
+
+function jumpToLine(index) {
+  const reader = app.querySelector('[data-reader-scroll]');
+  const line = app.querySelector(`[data-line-index="${index}"]`);
+  if (reader && line) reader.scrollTo({ top: line.offsetTop - 86, behavior: 'smooth' });
+}
+
+async function ensureDemoBook() {
+  const books = await getAllBooks(state.db, state.books);
+  if (!books.length) await persistBook(demoBook());
+}
+
+async function persistBook(book) {
+  await putBook(state.db, book, updateActiveBookInState);
+}
+
+function saveBookProgress(book) {
+  return persistBook({ ...book, scrollTop: Math.round(book.scrollTop || 0), progress: clamp(Math.round(book.progress || 0), 0, 100) });
+}
+
+function getActiveBook() {
+  return state.books.find((book) => book.id === state.activeBookId) || state.books[0] || null;
+}
+
+function updateActiveBookInState(book) {
+  const index = state.books.findIndex((item) => item.id === book.id);
+  if (index >= 0) state.books[index] = book;
+  else state.books = [book, ...state.books];
+}
+
+function updateVisibleProgress(book) {
+  const progressNode = app.querySelector('.message-title-row span:last-child');
+  const progressBar = app.querySelector('.pager span');
+  const activeRow = app.querySelector(`[data-book-id="${cssEscape(book.id)}"] time`);
+  if (progressNode) progressNode.textContent = book.progress ? `${book.progress}%` : '就绪';
+  if (progressBar) progressBar.style.width = `${book.progress}%`;
+  if (activeRow) activeRow.textContent = formatProgress(book.progress);
+}
+
+function bookRows() {
+  if (!state.books.length) return '<div class="thread-row active"><span>demo-novel</span><time>就绪</time></div>';
+  return state.books.map((book) => `
+    <div class="thread-row${book.id === state.activeBookId ? ' active' : ''}" role="button" tabindex="0" data-book-id="${escapeHtml(book.id)}">
+      <span contenteditable="true" spellcheck="false" data-edit-book-id="${escapeHtml(book.id)}">${escapeHtml(book.title)}</span>
+      <time>${formatProgress(book.progress)}</time>
+    </div>
+  `).join('');
+}
+
+function projectSections() {
+  return state.projectGroups.map((group) => `
+    <section class="sidebar-section project-section">
+      <div class="folder-title">${iconFolder()}<span contenteditable="true" spellcheck="false" data-project-group-id="${escapeHtml(group.id)}">${escapeHtml(group.title)}</span>${group.badge ? `<em>${escapeHtml(group.badge)}</em>` : ''}</div>
+      ${group.rows.map((row) => projectRow(row)).join('')}
+      <button class="thread-row ghost add-row" type="button" data-action="add-session" data-project-group-id="${escapeHtml(group.id)}"><span>新建会话</span><time>＋</time></button>
+      ${group.more ? '<button class="show-more" type="button">展开显示</button>' : ''}
+    </section>
+  `).join('');
+}
+
+function projectRow(row) {
+  const active = row.active ? ' active' : '';
+  return `
+    <div class="thread-row project-row${active}">
+      <span contenteditable="true" spellcheck="false" data-project-id="${escapeHtml(row.id)}">${escapeHtml(row.label)}</span>
+      <time>${escapeHtml(row.time || '')}</time>
+    </div>
+  `;
+}
+
+function defaultProjectGroups() {
+  return [];
+}
+
+function chapterJump(chapters) {
+  if (!chapters.length) return '';
+  return `
+    <div class="chapter-jump">
+      <span>${iconList()}章节</span>
+      <select id="chapter-select" aria-label="章节跳转">
+        <option value="">跳转到...</option>
+        ${chapters.map((chapter) => `<option value="${chapter.index}">${escapeHtml(chapter.title)}</option>`).join('')}
+      </select>
+    </div>
+  `;
+}
+
+function preferencesPanel() {
+  if (!state.prefsOpen) return '';
+  return `
+    <section class="prefs-panel" aria-label="阅读偏好">
+      <div class="prefs-header"><strong>阅读偏好</strong><button type="button" data-action="toggle-prefs" aria-label="关闭阅读偏好">×</button></div>
+      ${rangePreference('字号', 'fontSize', 16, 30, 1, `${state.fontSize}px`)}
+      ${rangePreference('行高', 'lineHeight', 1.6, 2.4, 0.1, state.lineHeight.toFixed(1))}
+      ${rangePreference('宽度', 'readerWidth', 680, 980, 20, `${state.readerWidth}px`)}
+      ${rangePreference('自动', 'autoScrollSpeed', 1, 10, 1, `${state.autoScrollSpeed}x`)}
+      <div class="pref-row"><span>播放</span><div class="segmented">${preferenceButton('autoScroll', false, '关闭')}${preferenceButton('autoScroll', true, '开启')}</div></div>
+      <div class="pref-row"><span>字体</span><div class="segmented">${preferenceButton('fontFamily', 'songti', '宋体')}${preferenceButton('fontFamily', 'serif', '衬线')}${preferenceButton('fontFamily', 'sans', '黑体')}</div></div>
+      <div class="pref-row"><span>主题</span><div class="segmented">${preferenceButton('theme', 'light', '浅色')}${preferenceButton('theme', 'dark', '暗色')}</div></div>
+    </section>
+  `;
+}
+
+function rangePreference(label, key, min, max, step, valueLabel) {
+  return `<label><span>${label}</span><input type="range" min="${min}" max="${max}" step="${step}" value="${state[key]}" data-pref="${key}" /><em>${valueLabel}</em></label>`;
+}
+
+function preferenceButton(key, value, label) {
+  return `<label class="segment"><input type="radio" name="${key}" value="${value}" data-pref="${key}"${state[key] === value ? ' checked' : ''} /><span>${label}</span></label>`;
+}
+
+function lineClass(line, index, matches) {
+  const classes = [];
+  if (isChapterTitle(line)) classes.push('chapter-line');
+  if (matches.some((match) => match.lineIndex === index)) classes.push('search-line');
+  return classes.join(' ');
+}
+
+function renderTextLine(line, index, matches) {
+  if (!matches.some((match) => match.lineIndex === index)) return escapeHtml(line);
+  return highlightSearchMatches(line, state.searchQuery);
+}
+
+function formatSearchCount(matches) {
+  if (!state.searchQuery.trim() || !matches.length) return '0/0';
+  return `${state.searchIndex + 1}/${matches.length}`;
+}
+
+function readFileText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(decodeTextBuffer(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function saveUi() {
+  saveJson(UI_KEY, {
+    activeBookId: state.activeBookId,
+    fontFamily: state.fontFamily,
+    fontSize: state.fontSize,
+    lineHeight: state.lineHeight,
+    readerWidth: state.readerWidth,
+    theme: state.theme,
+    autoScroll: state.autoScroll,
+    autoScrollSpeed: state.autoScrollSpeed,
+  });
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return CSS.escape(value);
+  return String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
 }
